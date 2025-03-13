@@ -27,7 +27,6 @@
 #   Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307,
 #   USA.
 #
-
 import getpass
 import hashlib
 import imaplib
@@ -36,6 +35,7 @@ import argparse
 import re
 import socket
 import sys
+import time
 from typing import List, Dict, Tuple, Optional, Type, Any
 
 from email.parser import BytesParser
@@ -45,7 +45,6 @@ from email.header import decode_header
 
 # Increase the max line length that imaplib expects to get back from the server,
 # since we're often dealing with big folders and large numbers of messages.
-
 imaplib._MAXLINE = max(10_000_000, imaplib._MAXLINE)
 
 class ImapDedupException(Exception):
@@ -65,9 +64,8 @@ def check_response(resp: Tuple[str, List[bytes]]):
 
 def get_arguments(args: Optional[List[str]] = None) -> Tuple[argparse.Namespace, List[str]]:
     """
-    Parse the given command-line arguments - defaults to using sys.argv
+    Parse the given command-line arguments - defaults to using sys.argv.
     """
-
     parser = argparse.ArgumentParser(
         description="Mark duplicate messages in IMAP mailboxes for deletion"
     )
@@ -155,11 +153,11 @@ def get_arguments(args: Optional[List[str]] = None) -> Tuple[argparse.Namespace,
         help="Walk through the folders in reverse order",
     )
     parser.add_argument(
-        "-t", "--only-tag", dest="tag_name", 
+        "-t", "--only-tag", dest="tag_name",
         help="Tag duplicates with specified tag instead of deleting them"
     )
     parser.add_argument(
-        "-y", "--copy", dest="copy_mailbox", 
+        "-y", "--copy", dest="copy_mailbox",
         help="Copy messages to specified mailbox before deleting them from current location."
     )
     parser.add_argument(
@@ -219,9 +217,8 @@ def parse_list_response(line: bytes):
     mailbox_name = mailbox_name.strip(b'"')
     return (flags, delimiter, mailbox_name)
 
-
 def str_header(parsed_message: Message, name: str) -> str:
-    """"
+    """
     Return the value (of the first instance, if more than one) of
     the given header, as a unicode string.
     """
@@ -229,7 +226,6 @@ def str_header(parsed_message: Message, name: str) -> str:
     btext, charset = hdrlist[0]
     text = btext if isinstance(btext, str) else btext.decode("utf-8", "ignore")
     return text.lstrip()
-
 
 def get_message_id(
     parsed_message: Message, options_use_checksum=False, options_use_id_in_checksum=False
@@ -265,7 +261,6 @@ def get_message_id(
             if options_use_id_in_checksum:
                 update(("Message-ID:" + str_header(parsed_message, "Message-ID")).encode())
             msg_id = md5.hexdigest() + "|" + sha.hexdigest() + "|" + sha3.hexdigest()
-            # print(msg_id)
         else:
             msg_id = str_header(parsed_message, "Message-ID")
             if not msg_id:
@@ -300,7 +295,6 @@ def get_message_id(
         print("Message skipped.")
         return None
 
-
 def get_mailbox_list(server: imaplib.IMAP4, directory: str = '""', pattern: str = '"*"') -> List[str]:
     """
     Return a list of usable mailbox names which match the pattern.
@@ -314,13 +308,12 @@ def get_mailbox_list(server: imaplib.IMAP4, directory: str = '""', pattern: str 
             resp.append(bits[2].decode())
     return resp
 
-
 def get_matching_msgnums(server: imaplib.IMAP4, query: str, sent_before: Optional[str]) -> List[int]:
     """
-    Return a list of ids of deleted messages in the folder.
+    Return a list of ids of messages in the folder matching the given query.
     """
     resp = []
-    if (sent_before is not None):
+    if sent_before is not None:
         query = f"{query} SENTBEFORE {sent_before}"
         print(f"Getting matching messages sent before {sent_before}")
     deleted_info = check_response(server.search(None, query))
@@ -348,47 +341,34 @@ def get_tagged_msgnums(server: imaplib.IMAP4, tag_name: str, sent_before: Option
     """
     return get_matching_msgnums(server, f"KEYWORD {tag_name}", sent_before)
 
-
-def process_messages(server: imaplib.IMAP4, msgs_to_delete: List[int], tag_name: Optional[str] = None, copy_mailbox: Optional[str] = None):
+# Updated get_msg_headers with a retry mechanism and pause
+def get_msg_headers(server: imaplib.IMAP4, msg_ids: List[int], retries: int = 3, pause: int = 5) -> List[Tuple[int, bytes]]:
     """
-    Actually do whatever we want to do to duplicates.
-    Tag them with (\\Deleted) or the specified tag_name.
-    Copy them to another mailbox first if copy_mailbox specified.
+    Get the header bytes for each message in the provided list of IDs,
+    with a retry mechanism if the fetch response is incomplete.
+    Returns a list of tuples: (msgid, header_bytes).
     """
-    message_ids = ",".join(map(str, msgs_to_delete))
-    action = tag_name or r"(\Deleted)"
-    if copy_mailbox:
-        check_response(
-            server.copy(message_ids, copy_mailbox)
-        )
-    check_response(
-        server.store(message_ids, "+FLAGS", action)
-    )
-
-
-def delete_marked_messages(server: imaplib.IMAP4):
-    print("Expunging deleted messages...")
-    check_response(server.expunge())
-
-
-def get_msg_headers(server: imaplib.IMAP4, msg_ids: List[int]) -> List[Tuple[int, bytes]]:
-    """
-    Get the dict of headers for each message in the list of provided IDs.
-    Return a list of tuples:  [ (msgid, header_bytes), (msgid, header_bytes)... ]
-    The returned header_bytes can be parsed by 
-    """
-    # Get the header info for each message
     message_ids_str = ",".join(map(str, msg_ids))
-    ms = check_response(server.fetch(message_ids_str, "(RFC822.HEADER)"))
-
-    # There are two lines per message in the response
-    resp: List[Tuple[int, bytes]] = []
-    for ci in range(len(ms) // 2):
+    for attempt in range(retries):
+        try:
+            ms = check_response(server.fetch(message_ids_str, "(RFC822.HEADER)"))
+            # Check if we got the expected number of response parts (2 parts per message)
+            if len(ms) < len(msg_ids) * 2:
+                raise ValueError("Incomplete fetch response")
+            break  # Successful fetch, exit retry loop.
+        except Exception as e:
+            print(f"Error fetching headers for messages {msg_ids[0]}-{msg_ids[-1]} (attempt {attempt + 1}/{retries}): {e}")
+            if attempt < retries - 1:
+                time.sleep(pause)
+            else:
+                raise
+    headers = []
+    count = min(len(ms) // 2, len(msg_ids))
+    for ci in range(count):
         mnum = int(msg_ids[ci])
-        _, hinfo = ms[ci * 2]
-        resp.append((mnum, hinfo))
-    return resp
-
+        header_tuple = ms[ci * 2]
+        headers.append((mnum, header_tuple[1]))
+    return headers
 
 def print_message_info(parsed_message: Message):
     print("From: " + str_header(parsed_message, "From"))
@@ -399,14 +379,11 @@ def print_message_info(parsed_message: Message):
     print("Date: " + str_header(parsed_message, "Date"))
     print("")
 
-
 def add_quotes(mbox: str) -> str:
     if " " in mbox and (mbox[0] != '"' or mbox[-1] != '"'):
         mbox = '"' + mbox + '"'
     return mbox
 
-
-# This actually does the work
 def process(options, mboxes: List[str]):
     serverclass: Type[Any]
     if options.process:
@@ -422,16 +399,11 @@ def process(options, mboxes: List[str]):
         elif options.port:
             server = serverclass(options.server, options.port)
         else:
-            # Use the default, which will be different depending on SSL choice
             server = serverclass(options.server)
     except socket.error as e:
-        sys.stderr.write(
-            "\nFailed to connect to server. Might be host, port or SSL settings?\n"
-        )
+        sys.stderr.write("\nFailed to connect to server. Might be host, port or SSL settings?\n")
         sys.stderr.write("%s\n\n" % e)
         sys.exit(1)
-
-    #  server.debug = 4  # If you want to see what's going on
 
     if ("STARTTLS" in server.capabilities) and hasattr(server, "starttls"):
         server.starttls()
@@ -444,21 +416,14 @@ def process(options, mboxes: List[str]):
     try:
         if not options.process:
             if options.authuser:
-                # Authenticate command - more info in RFC2501 sect 6.2.2
-                # and RFC2595 sect 6.
-                authcb = lambda resp: "{0}\x00{1}\x00{2}".format(
-                    options.user,options.authuser,options.password
-                )
+                authcb = lambda resp: "{0}\x00{1}\x00{2}".format(options.user, options.authuser, options.password)
                 server.authenticate("PLAIN", authcb)
             else:
-                # Standard single user password-based login
                 server.login(options.user, options.password)
-    except:
+    except Exception as e:
         sys.stderr.write("\nError: Login failed\n")
         sys.exit(1)
 
-    # List mailboxes option
-    # Just do that and then exit
     if options.just_list:
         for mb in get_mailbox_list(server):
             print(mb)
@@ -468,15 +433,11 @@ def process(options, mboxes: List[str]):
         sys.stderr.write("\nError: Must specify mailbox\n")
         sys.exit(1)
 
-    # Recursive option
-    # Add child mailboxes to mboxes
     if options.recursive:
-        # Make sure mailbox name is surrounded by quotes if it contains a space
         parent = add_quotes(mboxes[0])
-        # Fetch the hierarchy delimiter
         bits = parse_list_response(check_response(server.list(parent, '""'))[0])
         delimiter = bits[1].decode()
-        pattern='"' + delimiter + '*"'
+        pattern = '"' + delimiter + '*"'
         for mb in get_mailbox_list(server, parent, pattern):
             mboxes.append(mb)
         print("Working recursively from mailbox %s. There are %d total mailboxes." % (parent, len(mboxes)))
@@ -487,29 +448,20 @@ def process(options, mboxes: List[str]):
     if len(mboxes) > 1:
         print("Working with mailboxes in order: %s" % (", ".join(mboxes)))
 
-    # OK - let's get started.
-    # Iterate through a set of named mailboxes and delete the later messages discovered.
     try:
-        parser = BytesParser()  # can be the same for all mailboxes
-        # Create a list of previously seen message IDs, in any mailbox
+        parser = BytesParser()
         msg_ids: Dict[str, str] = {}
         for mbox in mboxes:
-            msgs_to_delete = []  # should be reset for each mbox
-            msg_map = {}  # should be reset for each mbox
+            msgs_to_delete = []
+            msg_map = {}
 
-            # Make sure mailbox name is surrounded by quotes if it contains a space
             mbox = add_quotes(mbox)
-
-            # Select the mailbox
             msgs = check_response(server.select(mailbox=mbox, readonly=options.dry_run))[0]
             print("There are %d messages in %s." % (int(msgs), mbox))
 
-            # Check how many messages are already marked 'deleted'...
             numdeleted = len(get_deleted_msgnums(server, options.sent_before))
             print(f'{numdeleted or "No"} message(s) currently marked as deleted in {mbox}')
 
-            # Now get a list of the ones that aren't deleted. 
-            # That's what we'll actually use.
             msgnums = get_undeleted_msgnums(server, options.sent_before)
             print(f"{len(msgnums)} others in {mbox}")
 
@@ -520,68 +472,43 @@ def process(options, mboxes: List[str]):
             for i in range(0, len(msgnums), chunkSize):
                 if options.verbose:
                     print("Batch starting at item %d" % i)
-
-                # and parse them.
-                for mnum, hinfo in get_msg_headers(server, msgnums[i: i + chunkSize]):
-                    # Parse the header info into a Message object
-                    mp = parser.parsebytes(hinfo)
-
-                    if options.verbose:
-                        print(f"Checking {mbox} message {mnum}")
-                        # Store message only when verbose is enabled (to print it later on)
-                        msg_map[mnum] = mp
-
-                    # Record the message-ID header (or generate one from other headers)
-                    msg_id = get_message_id(
-                        mp, options.use_checksum, options.use_id_in_checksum
-                    )
-
-                    if msg_id:
-                        # If we've seen this message before, record it as one to be
-                        # deleted in this mailbox.
-                        if msg_id in msg_ids:
-                            print(
-                                "Message %s_%s is a duplicate of %s and %s be %s"
-                                % (
+                try:
+                    for mnum, hinfo in get_msg_headers(server, msgnums[i: i + chunkSize]):
+                        if options.verbose:
+                            print(f"Checking {mbox} message {mnum}")
+                            # Save parsed message for verbose output
+                            msg_map[mnum] = parser.parsebytes(hinfo)
+                        mp = parser.parsebytes(hinfo)
+                        msg_id = get_message_id(mp, options.use_checksum, options.use_id_in_checksum)
+                        if msg_id:
+                            if msg_id in msg_ids:
+                                print("Message %s_%s is a duplicate of %s and %s be %s" % (
                                     mbox, mnum, msg_ids[msg_id],
                                     options.dry_run and "would" or "will",
                                     "tagged as '%s'" % options.tag_name if options.tag_name else "marked as deleted",
-                                ) 
-                            )
-                            if options.show or options.verbose:
-                                print(
-                                    "Subject: %s\nFrom: %s\nDate: %s\n"
-                                    % (mp["Subject"], mp["From"], mp["Date"])
-                                )
-                            msgs_to_delete.append(mnum)
-                        # Otherwise just record the fact that we've seen it
-                        else:
-                            msg_ids[msg_id] = f"{mbox}_{mnum}"
-
+                                ))
+                                if options.show or options.verbose:
+                                    print("Subject: %s\nFrom: %s\nDate: %s\n" % (mp["Subject"], mp["From"], mp["Date"]))
+                                msgs_to_delete.append(mnum)
+                            else:
+                                msg_ids[msg_id] = f"{mbox}_{mnum}"
+                except Exception as e:
+                    print(f"Error processing batch starting at item {i}: {e}")
                 print(f"{min(len(msgnums), i + chunkSize)} message(s) in {mbox} processed")
-
-            # OK - we've been through this mailbox, and msgs_to_delete holds
-            # a list of the duplicates we've found.
+                time.sleep(1)  # Short pause between batches to avoid overloading the server
 
             if not msgs_to_delete:
                 print(f"No duplicates were found in {mbox}")
-
             else:
                 if options.verbose:
                     print("These are the duplicate messages: ")
                     for mnum in msgs_to_delete:
                         print_message_info(msg_map[mnum])
-
                 if options.dry_run:
-                    print(
-                        "If you had NOT selected the 'dry-run' option,\n"
-                        "  %i messages would now be %s."
-                        % (
-                            len(msgs_to_delete),
-                            "tagged as '%s'" % options.tag_name if options.tag_name else "marked as deleted",
-                        )
-                    )
-
+                    print("If you had NOT selected the 'dry-run' option,\n  %i messages would now be %s." % (
+                        len(msgs_to_delete),
+                        "tagged as '%s'" % options.tag_name if options.tag_name else "marked as deleted",
+                    ))
                 else:
                     if options.copy_mailbox:
                         print("Copying %i messages to '%s'..." % (len(msgs_to_delete), options.copy_mailbox))
@@ -589,38 +516,60 @@ def process(options, mboxes: List[str]):
                         print("Tagging %i messages as '%s'..." % (len(msgs_to_delete), options.tag_name))
                     else:
                         print("Marking %i messages as deleted..." % (len(msgs_to_delete)))
-                    # Deleting messages one at a time can be slow if there are many,
-                    # so we batch them up.
-                    chunkSize = 30
+                    batch_size = 15
                     if options.verbose:
-                        print("(in batches of %d)" % chunkSize)
-                    for i in range(0, len(msgs_to_delete), chunkSize):
-                        process_messages(server, msgs_to_delete[i: i + chunkSize], options.tag_name, options.copy_mailbox)
+                        print("(in batches of %d)" % batch_size)
+                    for i in range(0, len(msgs_to_delete), batch_size):
+
+                        process_messages(server, msgs_to_delete[i: i + batch_size], options.tag_name, options.copy_mailbox)
+
                         if options.verbose:
                             print("Batch starting at item %d marked." % i)
                     print("Confirming new numbers...")
                     numdeleted = len(get_deleted_msgnums(server, options.sent_before))
                     numundel = len(get_undeleted_msgnums(server, options.sent_before))
-                    print(
-                        "There are now %s messages marked as deleted and %s others in %s."
-                        % (numdeleted, numundel, mbox)
-                    )
+                    print("There are now %s messages marked as deleted and %s others in %s." % (numdeleted, numundel, mbox))
                     if options.tag_name:
                         numtagged = len(get_tagged_msgnums(server, options.tag_name, options.sent_before))
-                        print(
-                        "There are now %s messages tagged as '%s' in %s."
-                        % (numtagged, options.tag_name, mbox)
-                    )
+                        print("There are now %s messages tagged as '%s' in %s." % (numtagged, options.tag_name, mbox))
             if options.delete_marked_messages:
                 delete_marked_messages(server)
-
         if not options.no_close:
             server.close()
-
     except ImapDedupException as e:
         print("Error:", e, file=sys.stderr)
     finally:
         server.logout()
+
+def process_messages(server: imaplib.IMAP4, msgs_to_delete: List[int], tag_name: Optional[str] = None,
+                     copy_mailbox: Optional[str] = None, retries: int = 3, pause: int = 5):
+    """
+    Process the messages: either mark them as deleted or tag them,
+    and copy them if a copy mailbox is specified.
+    Retries the operation if an error occurs.
+    """
+    message_ids = ",".join(map(str, msgs_to_delete))
+    action = tag_name or r"(\Deleted)"
+
+    for attempt in range(1, retries + 1):
+        try:
+            if copy_mailbox:
+                check_response(server.copy(message_ids, copy_mailbox))
+
+            check_response(server.store(message_ids, "+FLAGS", action))
+            time.sleep(1)  # Short pause between batches to avoid overloading the server
+            break  # Exit the loop if operation succeeds
+        except Exception as e:
+            if attempt < retries:
+                print(f"Attempt {attempt} failed: {e}. Retrying in {pause} seconds...")
+                time.sleep(pause)
+            else:
+                print(f"Attempt {attempt} failed: {e}. No more retries left.")
+                raise  # Re-raise the last exception if all retries fail
+
+def delete_marked_messages(server: imaplib.IMAP4):
+    print("Expunging deleted messages...")
+    check_response(server.expunge())
 
 def main():
     options, mboxes = get_arguments()
